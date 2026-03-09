@@ -1,14 +1,16 @@
-"""Rich terminal display for the content decay dashboard."""
+"""Rich terminal display for the Content Decay Dashboard."""
 
 from __future__ import annotations
 
 from datetime import date
 from typing import Sequence
 
+from rich import box
+from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
-from rich import box
 from rich.text import Text
 
 from .analyzer import DecayResult
@@ -17,62 +19,110 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
-# Colour helpers
+# Severity thresholds
+# ---------------------------------------------------------------------------
+_CRITICAL = 60
+_WARNING = 35
+
+
+def _severity_label(score: float) -> tuple[str, str]:
+    """Return (label, Rich style) based on score."""
+    if score >= _CRITICAL:
+        return "CRITICAL", "bold red"
+    if score >= _WARNING:
+        return "WARNING", "bold yellow"
+    return "MILD", "dim yellow"
+
+
+def _row_style(score: float) -> str:
+    if score >= _CRITICAL:
+        return "red"
+    if score >= _WARNING:
+        return "yellow"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Cell builders
 # ---------------------------------------------------------------------------
 
-def _severity_color(score: float) -> str:
-    if score >= 60:
-        return "bold red"
-    if score >= 35:
-        return "bold yellow"
-    return "yellow"
-
-
-def _change_color(value: float, *, invert: bool = False) -> str:
-    """Return a Rich style string for a numeric change value.
-
-    Args:
-        value:  The delta (positive or negative).
-        invert: If True, positive values are bad (e.g. position drop).
-    """
-    if invert:
-        if value > 0:
-            return "red"
-        if value < 0:
-            return "green"
+def _pos_cell(before: float, now: float) -> Text:
+    delta = now - before
+    t = Text()
+    t.append(f"{before:.1f}", style="dim")
+    t.append(" → ")
+    t.append(f"{now:.1f}", style="bold")
+    if delta > 0:
+        t.append(f"  ▲+{delta:.1f}", style="red")
+    elif delta < 0:
+        t.append(f"  ▼{delta:.1f}", style="green")
     else:
-        if value < 0:
-            return "red"
-        if value > 0:
-            return "green"
-    return "white"
+        t.append("  —", style="dim")
+    return t
 
 
-def _fmt_pct(value: float, *, sign: bool = True, invert: bool = False) -> Text:
-    color = _change_color(value, invert=invert)
-    prefix = "+" if (sign and value > 0) else ""
-    return Text(f"{prefix}{value:.1f}%", style=color)
+def _pct_cell(before: float, now: float, *, fmt: str = ".2f", suffix: str = "") -> Text:
+    """Generic before→now cell with coloured delta."""
+    delta = now - before
+    delta_pct = (delta / before * 100) if before else 0.0
+    t = Text()
+    t.append(f"{before:{fmt}}{suffix}", style="dim")
+    t.append(" → ")
+    t.append(f"{now:{fmt}}{suffix}", style="bold")
+    if delta < 0:
+        t.append(f"  ({delta_pct:+.1f}%)", style="red")
+    elif delta > 0:
+        t.append(f"  ({delta_pct:+.1f}%)", style="green")
+    else:
+        t.append("  (—)", style="dim")
+    return t
 
 
-def _fmt_pos_change(change: float) -> Text:
-    color = _change_color(change, invert=True)
-    prefix = "+" if change > 0 else ""
-    arrow = "▲" if change > 0 else ("▼" if change < 0 else "")
-    return Text(f"{arrow}{prefix}{change:+.1f}", style=color)
+def _clicks_cell(before: float, now: float) -> Text:
+    delta = now - before
+    delta_pct = (delta / before * 100) if before else 0.0
+    t = Text()
+    t.append(f"{before:,.0f}", style="dim")
+    t.append(" → ")
+    t.append(f"{now:,.0f}", style="bold")
+    if delta < 0:
+        t.append(f"  ({delta_pct:+.1f}%)", style="red")
+    elif delta > 0:
+        t.append(f"  ({delta_pct:+.1f}%)", style="green")
+    else:
+        t.append("  (—)", style="dim")
+    return t
 
 
 def _severity_bar(score: float) -> Text:
     filled = int(score / 10)
     bar = "█" * filled + "░" * (10 - filled)
-    color = _severity_color(score)
-    return Text(f"{bar} {score:.0f}", style=color)
+    label, style = _severity_label(score)
+    t = Text()
+    t.append(bar, style=style)
+    t.append(f"  {score:.0f}  ", style="dim")
+    t.append(label, style=style)
+    return t
 
 
-def _truncate_url(url: str, max_len: int = 55) -> str:
-    if len(url) <= max_len:
-        return url
-    # Keep the path, trim the middle
-    return url[: max_len - 3] + "…"
+def _title_cell(title: str, url: str, max_title: int = 48, max_url: int = 52) -> Text:
+    t = Text()
+    display_title = (title[:max_title] + "…") if len(title) > max_title else title
+    display_url = (url[:max_url] + "…") if len(url) > max_url else url
+    if display_title:
+        t.append(display_title + "\n", style="bold white")
+    t.append(display_url, style="dim cyan")
+    return t
+
+
+def _kw_loss_cell(lost: int, pct: float) -> Text:
+    if lost == 0:
+        return Text("—", style="dim")
+    t = Text()
+    t.append(f"{lost}", style="bold red")
+    if pct:
+        t.append(f"  ({pct:.0f}%)", style="red")
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -85,106 +135,138 @@ def display_decay_table(
     recent_end: date,
     prior_start: date,
     prior_end: date,
+    titles: dict[str, str] | None = None,
     top_n: int = 50,
+    property_url: str = "",
 ) -> None:
-    """Render the full content decay report to the terminal."""
+    """Render the full content decay report to stdout."""
 
-    # --- Header panel ---
-    header_lines = [
-        f"[bold white]Recent period:[/bold white]  {recent_start} → {recent_end}",
-        f"[bold white]Prior period:[/bold white]   {prior_start} → {prior_end}",
-        f"[bold white]Decaying URLs found:[/bold white] {len(results)}",
-    ]
+    titles = titles or {}
+    days = (recent_end - recent_start).days + 1
+    critical = [r for r in results if r.severity >= _CRITICAL]
+    warning = [r for r in results if _WARNING <= r.severity < _CRITICAL]
+    mild = [r for r in results if r.severity < _WARNING]
+
+    # ------------------------------------------------------------------
+    # Header panel
+    # ------------------------------------------------------------------
+    header = Text()
+    if property_url:
+        header.append(f"  Property   ", style="dim")
+        header.append(f"{property_url}\n", style="bold cyan")
+    header.append(f"  Recent     ", style="dim")
+    header.append(f"{recent_start}  →  {recent_end}", style="white")
+    header.append(f"  ({days} days)\n", style="dim")
+    header.append(f"  Prior      ", style="dim")
+    header.append(f"{prior_start}  →  {prior_end}", style="white")
+    header.append(f"  ({days} days)\n\n", style="dim")
+
+    if not results:
+        header.append("  ✓ No content decay detected — all pages are stable or improving.", style="bold green")
+    else:
+        header.append(f"  Decaying pages found:  ", style="dim")
+        header.append(f"{len(results)}\n", style="bold white")
+        header.append(f"  ", style="")
+        header.append(f"● {len(critical)} Critical  ", style="bold red")
+        header.append(f"● {len(warning)} Warning  ", style="bold yellow")
+        header.append(f"● {len(mild)} Mild", style="dim yellow")
+
+    console.print()
     console.print(
         Panel(
-            "\n".join(header_lines),
-            title="[bold cyan] Content Decay Dashboard[/bold cyan]",
+            header,
+            title="[bold cyan] Content Decay Dashboard [/bold cyan]",
             border_style="cyan",
             padding=(1, 2),
         )
     )
 
     if not results:
-        console.print(
-            "\n[bold green]No content decay detected.[/bold green] "
-            "All tracked pages are stable or improving.\n"
-        )
         return
 
+    # ------------------------------------------------------------------
+    # Main table
+    # ------------------------------------------------------------------
     display = list(results[:top_n])
 
-    # --- Main table ---
     table = Table(
         box=box.ROUNDED,
         border_style="dim",
         header_style="bold cyan",
         show_lines=True,
         expand=True,
-        title=f"[bold]Top {len(display)} Decaying Pages[/bold] (sorted by severity)",
-        title_style="bold white",
+        title=f"[bold white]Top {len(display)} Decaying Pages[/bold white]"
+        f"[dim]  —  sorted by severity[/dim]",
+        title_style="",
+        caption="[dim]▲ = position worsened (higher number)   ▼ = position improved[/dim]",
     )
 
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("URL", min_width=35, no_wrap=False)
-    table.add_column("Pos\nBefore", justify="right", width=7)
-    table.add_column("Pos\nNow", justify="right", width=7)
-    table.add_column("Pos\nΔ", justify="right", width=7)
-    table.add_column("CTR\nBefore", justify="right", width=8)
-    table.add_column("CTR\nNow", justify="right", width=8)
-    table.add_column("CTR Δ%", justify="right", width=8)
-    table.add_column("Clicks\nBefore", justify="right", width=8)
-    table.add_column("Clicks\nNow", justify="right", width=8)
-    table.add_column("Clicks Δ%", justify="right", width=10)
-    table.add_column("P1 Kws\nLost", justify="right", width=9)
-    table.add_column("Severity", width=20)
-    table.add_column("Flags", min_width=20)
+    table.add_column("#", width=3, justify="right", style="dim")
+    table.add_column("Article / URL", min_width=40, no_wrap=False)
+    table.add_column("Position\nbefore → now (Δ)", min_width=22, justify="left")
+    table.add_column("CTR\nbefore → now (Δ%)", min_width=22, justify="left")
+    table.add_column("Clicks\nbefore → now (Δ%)", min_width=22, justify="left")
+    table.add_column("Page-1\nKws Lost", width=12, justify="center")
+    table.add_column("Severity", min_width=26, justify="left")
+    table.add_column("Signals", min_width=24, no_wrap=False)
 
     for idx, r in enumerate(display, start=1):
-        ctr_change_pct = (
-            (r.ctr_change / r.prior_ctr * 100) if r.prior_ctr else 0.0
-        )
-        p1_loss_text = (
-            Text(str(r.page1_kw_loss), style="red bold")
-            if r.page1_kw_loss > 0
-            else Text("0", style="dim")
-        )
+        title = titles.get(r.url, "")
         flags_text = Text(", ".join(r.flags) if r.flags else "—", style="dim")
 
         table.add_row(
             str(idx),
-            _truncate_url(r.url),
-            f"{r.prior_position:.1f}",
-            Text(f"{r.recent_position:.1f}", style=_change_color(r.position_change, invert=True)),
-            _fmt_pos_change(r.position_change),
-            f"{r.prior_ctr * 100:.2f}%",
-            Text(f"{r.recent_ctr * 100:.2f}%", style=_change_color(r.ctr_change)),
-            _fmt_pct(ctr_change_pct, invert=False) if r.ctr_change < 0 else Text(f"+{ctr_change_pct:.1f}%", style="green"),
-            f"{r.prior_clicks:.0f}",
-            Text(f"{r.recent_clicks:.0f}", style=_change_color(r.click_change)),
-            _fmt_pct(r.click_change_pct),
-            p1_loss_text,
+            _title_cell(title, r.url),
+            _pos_cell(r.prior_position, r.recent_position),
+            _pct_cell(r.prior_ctr * 100, r.recent_ctr * 100, fmt=".2f", suffix="%"),
+            _clicks_cell(r.prior_clicks, r.recent_clicks),
+            _kw_loss_cell(r.page1_kw_loss, r.page1_kw_loss_pct),
             _severity_bar(r.severity),
             flags_text,
+            style=_row_style(r.severity),
         )
 
     console.print(table)
 
-    # --- Summary stats ---
-    avg_pos_drop = sum(r.position_change for r in results if r.position_change > 0) / max(
-        sum(1 for r in results if r.position_change > 0), 1
+    # ------------------------------------------------------------------
+    # Summary panel
+    # ------------------------------------------------------------------
+    avg_pos_drop = (
+        sum(r.position_change for r in results if r.position_change > 0)
+        / max(sum(1 for r in results if r.position_change > 0), 1)
     )
     total_click_loss = sum(r.click_change for r in results if r.click_change < 0)
-    fell_off_page1 = sum(
+    fell_off_p1 = sum(
         1 for r in results if r.prior_position <= 10 and r.recent_position > 10
     )
+    total_kw_loss = sum(r.page1_kw_loss for r in results)
+
+    left = Text()
+    left.append("Severity breakdown\n\n", style="bold white")
+    left.append("● Critical  (≥60)  ", style="bold red")
+    left.append(f"{len(critical)} pages\n", style="bold white")
+    left.append("● Warning   (≥35)  ", style="bold yellow")
+    left.append(f"{len(warning)} pages\n", style="bold white")
+    left.append("● Mild      (<35)  ", style="dim yellow")
+    left.append(f"{len(mild)} pages", style="bold white")
+
+    right = Text()
+    right.append("Key metrics\n\n", style="bold white")
+    right.append("Avg position drop       ", style="dim")
+    right.append(f"{avg_pos_drop:+.1f}\n", style="red" if avg_pos_drop > 0 else "green")
+    right.append("Total click loss        ", style="dim")
+    right.append(f"{total_click_loss:,.0f}\n", style="red")
+    right.append("Pages fell off page 1   ", style="dim")
+    right.append(f"{fell_off_p1}\n", style="red" if fell_off_p1 else "white")
+    right.append("Total page-1 kw lost    ", style="dim")
+    right.append(f"{total_kw_loss}", style="red" if total_kw_loss else "white")
 
     console.print(
         Panel(
-            f"[bold]Avg position drop (decaying pages):[/bold] {avg_pos_drop:.1f}\n"
-            f"[bold]Total click loss:[/bold] {total_click_loss:,.0f}\n"
-            f"[bold]Pages that fell off page 1:[/bold] {fell_off_page1}",
-            title="[bold cyan]Summary[/bold cyan]",
+            Columns([left, right], expand=True, padding=(0, 6)),
+            title="[bold cyan] Summary [/bold cyan]",
             border_style="cyan",
-            padding=(1, 2),
+            padding=(1, 3),
         )
     )
+    console.print()
